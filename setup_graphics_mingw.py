@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-  Automated OpenGL (FreeGLUT) & MinGW-w64 Setup with Live Progress & ETA
+  Automated OpenGL (FreeGLUT) & MinGW Setup (Auto 32-bit / 64-bit Aware)
 ===============================================================================
 """
 
@@ -14,7 +14,6 @@ import zipfile
 import ctypes
 import time
 from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
 
 if sys.platform != "win32":
     print("\n[ERROR] This script must be run on Windows.")
@@ -28,21 +27,9 @@ except ImportError:
 
 DEFAULT_MINGW_DIR = r"C:\MinGW"
 
-# 64-bit MinGW-w64 standalone zips (WinLibs)
-MINGW64_URLS = [
-    "https://github.com/brechtsanders/winlibs_mingw/releases/download/"
-    "13.2.0posix-18.1.5-11.0.1-ucrt-r5/"
-    "winlibs-x86_64-posix-seh-gcc-13.2.0-mingw-w64ucrt-11.0.1-r5.zip",
-    "https://github.com/brechtsanders/winlibs_mingw/releases/download/"
-    "12.2.0-16.0.0-10.0.0-ucrt-r5/"
-    "winlibs-x86_64-posix-seh-gcc-12.2.0-mingw-w64ucrt-10.0.0-r5.zip",
-]
-
-# High-availability mirrors for FreeGLUT MinGW 64-bit
+# FreeGLUT MinGW package (contains both 32-bit and 64-bit builds)
 FREEGLUT_URLS = [
-    # Primary: Active & verified FreeGLUT 3.8.0 for MinGW
     "https://www.songho.ca/opengl/files/freeglut-mingw-3.8.0.zip",
-    # Backup: Archive.org permanent CDN snapshot
     "https://web.archive.org/web/20220401102719if_/https://www.transmissionzero.co.uk/files/software/development/GLUT/freeglut-MinGW-3.0.0-1.mp.zip",
 ]
 
@@ -78,27 +65,34 @@ def is_admin():
     except Exception:
         return False
 
+def get_compiler_arch(mingw_root):
+    """Detects whether the installed GCC is 32-bit (x86) or 64-bit (x64)."""
+    gcc = os.path.join(mingw_root, "bin", "gcc.exe")
+    if not os.path.isfile(gcc):
+        return "x86"
+    try:
+        out = subprocess.check_output([gcc, "-dumpmachine"], text=True, timeout=5).strip().lower()
+        if "64" in out:
+            return "x64"
+        else:
+            return "x86"
+    except Exception:
+        return "x86"
+
 # ==========================================================================
-#  PROGRESS BAR RENDERER (LIVE SPEED + ETA)
+#  PROGRESS BAR RENDERER
 # ==========================================================================
 
 def render_progress(current, total, start_time, prefix="[PROG]", unit="MB", bar_len=24):
     elapsed = max(time.time() - start_time, 0.001)
     fraction = min(max(current / total, 0.0), 1.0) if total > 0 else 0
     pct = int(fraction * 100)
-
     filled = int(bar_len * fraction)
     bar = "█" * filled + "░" * (bar_len - filled)
-
     speed = current / elapsed
     remaining = (total - current) / speed if speed > 0 else 0
 
-    if remaining < 60:
-        eta_str = f"{int(remaining)}s"
-    elif remaining < 3600:
-        eta_str = f"{int(remaining//60)}m {int(remaining%60):02d}s"
-    else:
-        eta_str = ">1h"
+    eta_str = f"{int(remaining)}s" if remaining < 60 else f"{int(remaining//60)}m {int(remaining%60):02d}s"
 
     if unit == "MB":
         cur_mb = current / (1024 * 1024)
@@ -110,13 +104,9 @@ def render_progress(current, total, start_time, prefix="[PROG]", unit="MB", bar_
 
     print(f"\r  {Colors.CYAN}{prefix}{Colors.RESET} [{Colors.GREEN}{bar}{Colors.RESET}] {pct:3d}% | {status} | ETA: {Colors.YELLOW}{eta_str}{Colors.RESET}  ", end="", flush=True)
 
-# ==========================================================================
-#  DOWNLOAD & EXTRACT
-# ==========================================================================
-
 def download_file_with_progress(urls, dest_path, desc):
     req_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "*/*",
     }
     for idx, url in enumerate(urls):
@@ -146,113 +136,49 @@ def download_file_with_progress(urls, dest_path, desc):
         except Exception as e:
             print()
             log_warn(f"Mirror #{idx+1} failed: {e}")
-            if idx < len(urls) - 1:
-                log_info("Trying fallback mirror...")
-    log_err(f"Failed to download {desc} from all available mirrors.")
     return False
 
-def extract_zip_with_progress(zip_path, dest_dir, prefix="[EXTR]"):
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        members = zf.infolist()
-        total_files = len(members)
-        start_time = time.time()
-        last_render = 0
-
-        for i, member in enumerate(members, start=1):
-            zf.extract(member, dest_dir)
-            now = time.time()
-            if now - last_render >= 0.1 or i == total_files:
-                render_progress(i, total_files, start_time, prefix=prefix, unit="files")
-                last_render = now
-    print()
-    log_ok("Extraction complete.")
-
 # ==========================================================================
-#  DETECTION & INSTALLATION
+#  INSTALLATION ROUTINE (ARCH-AWARE)
 # ==========================================================================
 
 def find_existing_mingw():
     candidates = []
     for path_dir in os.environ.get("PATH", "").split(os.pathsep):
         path_dir = path_dir.strip().strip('"')
-        if os.path.isfile(os.path.join(path_dir, "g++.exe")):
+        if os.path.isfile(os.path.join(path_dir, "gcc.exe")):
             root = os.path.dirname(os.path.normpath(path_dir))
             if root not in candidates:
                 candidates.append(root)
 
-    standard_locs = [
-        r"C:\MinGW", r"C:\mingw64", r"C:\msys64\mingw64",
-        r"C:\msys64\ucrt64", r"C:\TDM-GCC-64", os.path.expanduser(r"~\mingw64")
-    ]
-    for loc in standard_locs:
-        if os.path.isfile(os.path.join(loc, "bin", "g++.exe")) and loc not in candidates:
+    for loc in [r"C:\MinGW", r"C:\mingw64", r"C:\mingw32", r"C:\msys64\mingw64", r"C:\msys64\ucrt64"]:
+        if os.path.isfile(os.path.join(loc, "bin", "gcc.exe")) and loc not in candidates:
             candidates.append(loc)
     return candidates
 
-def check_freeglut_installed(mingw_root):
-    inc_glut = [
-        os.path.join(mingw_root, "include", "GL", "glut.h"),
-        os.path.join(mingw_root, "x86_64-w64-mingw32", "include", "GL", "glut.h"),
-    ]
-    lib_glut = [
-        os.path.join(mingw_root, "lib", "libfreeglut.a"),
-        os.path.join(mingw_root, "lib", "libfreeglut.dll.a"),
-        os.path.join(mingw_root, "x86_64-w64-mingw32", "lib", "libfreeglut.a"),
-    ]
-    dll_glut = [
-        os.path.join(mingw_root, "bin", "freeglut.dll"),
-        os.path.join(mingw_root, "bin", "libfreeglut.dll"),
-    ]
-    return any(os.path.isfile(p) for p in inc_glut) and any(os.path.isfile(p) for p in lib_glut) and any(os.path.isfile(p) for p in dll_glut)
+def install_freeglut(mingw_root, arch):
+    log_info(f"Deploying FreeGLUT for {Colors.BOLD}{arch.upper()}{Colors.RESET} MinGW architecture...")
 
-def install_mingw(target_dir):
-    log_info(f"Setting up 64-bit MinGW-w64 at {target_dir}...")
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zip_path = os.path.join(tmp_dir, "mingw.zip")
-        if not download_file_with_progress(MINGW64_URLS, zip_path, "MinGW-w64 (~150-200 MB)"):
-            return None
-
-        log_info("Extracting GCC compiler files...")
-        try:
-            extract_zip_with_progress(zip_path, tmp_dir, prefix="[EXTR]")
-        except Exception as e:
-            log_err(f"Extraction failed: {e}")
-            return None
-
-        extracted_root = None
-        for root, dirs, files in os.walk(tmp_dir):
-            if "g++.exe" in files:
-                extracted_root = os.path.dirname(root)
-                break
-
-        if not extracted_root:
-            log_err("Could not find extracted compiler binaries.")
-            return None
-
-        if os.path.exists(target_dir):
-            try:
-                shutil.rmtree(target_dir)
-            except Exception:
-                target_dir = target_dir + f"_new_{int(time.time())}"
-
-        os.makedirs(os.path.dirname(target_dir), exist_ok=True)
-        shutil.move(extracted_root, target_dir)
-        log_ok(f"MinGW-w64 deployed to: {target_dir}")
-        return target_dir
-
-def install_freeglut(mingw_root):
-    log_info("Installing FreeGLUT headers, libraries, and runtime DLL...")
+    # Include directories
     inc_dirs = [
         os.path.join(mingw_root, "include", "GL"),
         os.path.join(mingw_root, "x86_64-w64-mingw32", "include", "GL"),
+        os.path.join(mingw_root, "i686-w64-mingw32", "include", "GL"),
+        os.path.join(mingw_root, "mingw32", "include", "GL"),
     ]
+    # Library directories
     lib_dirs = [
         os.path.join(mingw_root, "lib"),
         os.path.join(mingw_root, "x86_64-w64-mingw32", "lib"),
+        os.path.join(mingw_root, "i686-w64-mingw32", "lib"),
+        os.path.join(mingw_root, "mingw32", "lib"),
     ]
     bin_dir = os.path.join(mingw_root, "bin")
 
-    for d in inc_dirs + lib_dirs + [bin_dir]:
+    # Only create existing / valid directories
+    valid_inc = [d for d in inc_dirs if os.path.isdir(os.path.dirname(d)) or d == inc_dirs[0]]
+    valid_lib = [d for d in lib_dirs if os.path.isdir(d) or d == lib_dirs[0]]
+    for d in valid_inc + valid_lib + [bin_dir]:
         os.makedirs(d, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -260,33 +186,31 @@ def install_freeglut(mingw_root):
         if not download_file_with_progress(FREEGLUT_URLS, fg_zip, "FreeGLUT Package (~1 MB)"):
             return False
 
-        log_info("Extracting FreeGLUT package...")
         with zipfile.ZipFile(fg_zip, "r") as zf:
             zf.extractall(tmp_dir)
 
         # 1. Install headers
-        header_count = 0
         for root, dirs, files in os.walk(tmp_dir):
             if any(h in files for h in ["glut.h", "freeglut.h"]):
                 for file in files:
                     if file.endswith(".h"):
                         src = os.path.join(root, file)
-                        for dest in inc_dirs:
+                        for dest in valid_inc:
                             shutil.copy2(src, os.path.join(dest, file))
-                        header_count += 1
                 break
-        log_ok(f"Installed {header_count} OpenGL/GLUT headers.")
+        log_ok("Headers copied (GL/glut.h, GL/freeglut.h).")
 
-        # 2. Install 64-bit libraries
-        # Prefer x64 folder if present, otherwise general lib folder
+        # 2. Select matching library folder based on detected architecture
         lib_folder = None
-        for root, dirs, files in os.walk(tmp_dir):
-            if "x64" in root.lower() and any(f.endswith(".a") for f in files):
-                lib_folder = root
-                break
-        if not lib_folder:
+        if arch == "x64":
             for root, dirs, files in os.walk(tmp_dir):
-                if any(f.endswith(".a") for f in files):
+                if "x64" in root.lower() and any(f.endswith(".a") for f in files):
+                    lib_folder = root
+                    break
+        else:
+            # 32-bit (x86): Pick the 'lib' folder that does NOT have x64 in its path
+            for root, dirs, files in os.walk(tmp_dir):
+                if "lib" in root.lower() and "x64" not in root.lower() and any(f.endswith(".a") for f in files):
                     lib_folder = root
                     break
 
@@ -294,90 +218,42 @@ def install_freeglut(mingw_root):
             for file in os.listdir(lib_folder):
                 if file.endswith((".a", ".lib")):
                     src = os.path.join(lib_folder, file)
-                    for dest in lib_dirs:
+                    for dest in valid_lib:
                         shutil.copy2(src, os.path.join(dest, file))
-                    # Ensure canonical 'libfreeglut.a' always exists
                     if "freeglut" in file.lower():
-                        for dest in lib_dirs:
+                        for dest in valid_lib:
+                            # Create both libfreeglut.a and libfreeglut.dll.a
                             shutil.copy2(src, os.path.join(dest, "libfreeglut.a"))
-            log_ok("Installed FreeGLUT static and import libraries.")
+                            shutil.copy2(src, os.path.join(dest, "libfreeglut.dll.a"))
+            log_ok(f"Installed {arch.upper()} static & import libraries.")
 
-        # 3. Install runtime DLL
-        dll_found = False
-        for root, dirs, files in os.walk(tmp_dir):
-            # Prefer 64-bit DLL
-            if "x64" in root.lower() and any(f.endswith(".dll") for f in files):
-                for f in files:
-                    if f.endswith(".dll"):
-                        src = os.path.join(root, f)
-                        # Copy as both freeglut.dll and libfreeglut.dll for universal compatibility
-                        shutil.copy2(src, os.path.join(bin_dir, "freeglut.dll"))
-                        shutil.copy2(src, os.path.join(bin_dir, "libfreeglut.dll"))
-                        dll_found = True
-                break
-
-        if not dll_found:
+        # 3. Select matching DLL based on detected architecture
+        dll_folder = None
+        if arch == "x64":
             for root, dirs, files in os.walk(tmp_dir):
-                for f in files:
-                    if f.endswith(".dll") and "freeglut" in f.lower():
-                        src = os.path.join(root, f)
-                        shutil.copy2(src, os.path.join(bin_dir, "freeglut.dll"))
-                        shutil.copy2(src, os.path.join(bin_dir, "libfreeglut.dll"))
-                        dll_found = True
-                        break
-
-        if dll_found:
-            log_ok(f"Installed runtime DLLs (freeglut.dll & libfreeglut.dll) to: {bin_dir}")
+                if "x64" in root.lower() and any(f.endswith(".dll") for f in files):
+                    dll_folder = root
+                    break
         else:
-            log_warn("Could not locate freeglut DLL in archive.")
+            # 32-bit (x86): Pick the 'bin' folder that does NOT have x64 in its path
+            for root, dirs, files in os.walk(tmp_dir):
+                if "bin" in root.lower() and "x64" not in root.lower() and any(f.endswith(".dll") for f in files):
+                    dll_folder = root
+                    break
+
+        if dll_folder:
+            for f in os.listdir(dll_folder):
+                if f.endswith(".dll") and "freeglut" in f.lower():
+                    src = os.path.join(dll_folder, f)
+                    shutil.copy2(src, os.path.join(bin_dir, "freeglut.dll"))
+                    shutil.copy2(src, os.path.join(bin_dir, "libfreeglut.dll"))
+            log_ok(f"Installed {arch.upper()} runtime DLLs to: {bin_dir}")
 
     return True
 
 # ==========================================================================
-#  PATH MANAGEMENT & VERIFICATION
+#  VERIFICATION
 # ==========================================================================
-
-def update_path(mingw_bin):
-    norm_bin = os.path.normpath(mingw_bin).lower()
-    cur_path = os.environ.get("PATH", "")
-
-    if any(os.path.normpath(p).lower() == norm_bin for p in cur_path.split(os.pathsep)):
-        log_ok(f"Already in active PATH: {mingw_bin}")
-        return True
-
-    os.environ["PATH"] = mingw_bin + os.pathsep + cur_path
-
-    if not _WINREG_AVAILABLE:
-        return False
-
-    hive = winreg.HKEY_LOCAL_MACHINE if is_admin() else winreg.HKEY_CURRENT_USER
-    sub = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment" if is_admin() else r"Environment"
-
-    try:
-        with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
-            try:
-                reg_path, ptype = winreg.QueryValueEx(key, "Path")
-            except FileNotFoundError:
-                reg_path, ptype = "", winreg.REG_EXPAND_SZ
-
-            parts = [p.strip() for p in reg_path.split(";") if p.strip()]
-            if not any(os.path.normpath(p).lower() == norm_bin for p in parts):
-                parts.append(mingw_bin)
-                winreg.SetValueEx(key, "Path", 0, ptype, ";".join(parts))
-                scope = "SYSTEM" if is_admin() else "USER"
-                log_ok(f"Permanently registered in {scope} PATH.")
-
-                try:
-                    ctypes.windll.user32.SendMessageTimeoutW(
-                        0xFFFF, 0x001A, 0, "Environment", 0x0002, 3000, ctypes.byref(ctypes.c_long())
-                    )
-                except Exception:
-                    pass
-                return True
-    except Exception as e:
-        log_warn(f"Could not write to registry PATH: {e}")
-
-    return True
 
 def verify_setup(mingw_root):
     log_info("Testing compilation and runtime DLL execution...")
@@ -404,8 +280,8 @@ def verify_setup(mingw_root):
         env = os.environ.copy()
         env["PATH"] = os.path.join(mingw_root, "bin") + os.pathsep + env.get("PATH", "")
 
-        res = subprocess.run([gpp, src, "-o", exe, "-lfreeglut", "-lopengl32", "-lglu32"],
-                             capture_output=True, text=True, env=env)
+        cmd = [gpp, src, "-o", exe, "-lfreeglut", "-lopengl32", "-lglu32"]
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if res.returncode != 0:
             log_err("Compilation failed:")
             print(res.stderr)
@@ -444,54 +320,40 @@ def main():
     # Step 1: Detect
     log_step(1, total_steps, "Scanning System for Existing Installations")
     installs = find_existing_mingw()
-    selected_mingw = None
+    if not installs:
+        log_err("No MinGW compiler found. Please ensure MinGW is at C:\\MinGW.")
+        return 1
 
-    if installs:
-        log_ok(f"Found existing MinGW installation(s):")
-        for inst in installs:
-            has_glut = check_freeglut_installed(inst)
-            tag = f"{Colors.GREEN}(FreeGLUT ready){Colors.RESET}" if has_glut else f"{Colors.YELLOW}(FreeGLUT missing){Colors.RESET}"
-            print(f"    - {inst} {tag}")
-        selected_mingw = installs[0]
-        log_info(f"Targeting: {selected_mingw}")
-    else:
-        log_warn("No MinGW compiler detected.")
+    selected_mingw = installs[0]
+    arch = get_compiler_arch(selected_mingw)
+    log_ok(f"Using compiler at: {selected_mingw}")
+    log_info(f"Detected Compiler Architecture: {Colors.BOLD}{arch.upper()}{Colors.RESET} ({'32-bit' if arch == 'x86' else '64-bit'})")
 
-    # Step 2: MinGW
-    log_step(2, total_steps, "MinGW-w64 Deployment")
-    if not selected_mingw:
-        selected_mingw = install_mingw(DEFAULT_MINGW_DIR)
-        if not selected_mingw:
-            return 1
-    else:
-        log_ok(f"Using existing compiler at: {selected_mingw}")
+    # Step 2: Confirmation
+    log_step(2, total_steps, "Target Verification")
+    log_ok(f"Targeting {arch.upper()} environment in {selected_mingw}")
 
     # Step 3: FreeGLUT
     log_step(3, total_steps, "FreeGLUT Deployment")
-    if check_freeglut_installed(selected_mingw):
-        log_ok("FreeGLUT is already fully configured.")
-    else:
-        if not install_freeglut(selected_mingw):
-            return 1
-        log_ok("FreeGLUT successfully configured.")
+    if not install_freeglut(selected_mingw, arch):
+        log_err("FreeGLUT installation failed.")
+        return 1
+    log_ok("FreeGLUT successfully configured.")
 
-    # Step 4: PATH & Verify
-    log_step(4, total_steps, "Configuring PATH & Verifying Setup")
-    bin_path = os.path.join(selected_mingw, "bin")
-    update_path(bin_path)
-
+    # Step 4: Verification
+    log_step(4, total_steps, "Verifying Setup")
     if verify_setup(selected_mingw):
         print(f"\n{Colors.BOLD}{Colors.GREEN}"
               f"  =========================================================\n"
               f"                SETUP COMPLETED SUCCESSFULLY!              \n"
               f"  ========================================================={Colors.RESET}\n")
+        print(f"  Architecture   : {Colors.GREEN}{arch.upper()} ({'32-bit' if arch == 'x86' else '64-bit'}){Colors.RESET}")
         print(f"  MinGW Location : {Colors.GREEN}{selected_mingw}{Colors.RESET}")
         print(f"  Headers        : {Colors.GREEN}{os.path.join(selected_mingw, 'include', 'GL', 'glut.h')}{Colors.RESET}")
-        print(f"  FreeGLUT DLL   : {Colors.GREEN}{os.path.join(bin_path, 'freeglut.dll')}{Colors.RESET}\n")
+        print(f"  FreeGLUT DLL   : {Colors.GREEN}{os.path.join(selected_mingw, 'bin', 'freeglut.dll')}{Colors.RESET}\n")
 
         print(f"  {Colors.BOLD}How to compile your OpenGL assignments:{Colors.RESET}")
         print(f"  {Colors.CYAN}g++ ass2_opengl.cpp -o ass2.exe -lfreeglut -lopengl32 -lglu32{Colors.RESET}\n")
-        print(f"  {Colors.DIM}(Please restart your terminal/CMD so the new PATH takes effect){Colors.RESET}\n")
         return 0
     else:
         log_err("Verification check failed.")

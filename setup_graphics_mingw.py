@@ -28,6 +28,7 @@ except ImportError:
 
 DEFAULT_MINGW_DIR = r"C:\MinGW"
 
+# 64-bit MinGW-w64 standalone zips (WinLibs)
 MINGW64_URLS = [
     "https://github.com/brechtsanders/winlibs_mingw/releases/download/"
     "13.2.0posix-18.1.5-11.0.1-ucrt-r5/"
@@ -37,8 +38,12 @@ MINGW64_URLS = [
     "winlibs-x86_64-posix-seh-gcc-12.2.0-mingw-w64ucrt-10.0.0-r5.zip",
 ]
 
+# High-availability mirrors for FreeGLUT MinGW 64-bit
 FREEGLUT_URLS = [
-    "https://www.transmissionzero.co.uk/files/software/development/GLUT/freeglut-MinGW.zip",
+    # Primary: Active & verified FreeGLUT 3.8.0 for MinGW
+    "https://www.songho.ca/opengl/files/freeglut-mingw-3.8.0.zip",
+    # Backup: Archive.org permanent CDN snapshot
+    "https://web.archive.org/web/20220401102719if_/https://www.transmissionzero.co.uk/files/software/development/GLUT/freeglut-MinGW-3.0.0-1.mp.zip",
 ]
 
 class Colors:
@@ -106,16 +111,19 @@ def render_progress(current, total, start_time, prefix="[PROG]", unit="MB", bar_
     print(f"\r  {Colors.CYAN}{prefix}{Colors.RESET} [{Colors.GREEN}{bar}{Colors.RESET}] {pct:3d}% | {status} | ETA: {Colors.YELLOW}{eta_str}{Colors.RESET}  ", end="", flush=True)
 
 # ==========================================================================
-#  DOWNLOAD & EXTRACT WITH REAL PROGRESS
+#  DOWNLOAD & EXTRACT
 # ==========================================================================
 
 def download_file_with_progress(urls, dest_path, desc):
-    req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
     for idx, url in enumerate(urls):
-        log_info(f"Downloading {desc} (source {idx+1}/{len(urls)})...")
+        log_info(f"Connecting to {desc} (source {idx+1}/{len(urls)})...")
         try:
             req = Request(url, headers=req_headers)
-            with urlopen(req, timeout=180) as resp, open(dest_path, "wb") as out:
+            with urlopen(req, timeout=30) as resp, open(dest_path, "wb") as out:
                 total_len = resp.getheader("Content-Length")
                 total_size = int(total_len) if total_len else 0
                 downloaded = 0
@@ -137,12 +145,13 @@ def download_file_with_progress(urls, dest_path, desc):
             return True
         except Exception as e:
             print()
-            log_warn(f"Download mirror failed: {e}")
-    log_err(f"Failed to download {desc}.")
+            log_warn(f"Mirror #{idx+1} failed: {e}")
+            if idx < len(urls) - 1:
+                log_info("Trying fallback mirror...")
+    log_err(f"Failed to download {desc} from all available mirrors.")
     return False
 
 def extract_zip_with_progress(zip_path, dest_dir, prefix="[EXTR]"):
-    """Extracts zip archive while reporting live file count and ETA."""
     with zipfile.ZipFile(zip_path, "r") as zf:
         members = zf.infolist()
         total_files = len(members)
@@ -159,7 +168,7 @@ def extract_zip_with_progress(zip_path, dest_dir, prefix="[EXTR]"):
     log_ok("Extraction complete.")
 
 # ==========================================================================
-#  INSTALLATION ROUTINES
+#  DETECTION & INSTALLATION
 # ==========================================================================
 
 def find_existing_mingw():
@@ -187,10 +196,14 @@ def check_freeglut_installed(mingw_root):
     ]
     lib_glut = [
         os.path.join(mingw_root, "lib", "libfreeglut.a"),
+        os.path.join(mingw_root, "lib", "libfreeglut.dll.a"),
         os.path.join(mingw_root, "x86_64-w64-mingw32", "lib", "libfreeglut.a"),
     ]
-    dll_glut = os.path.join(mingw_root, "bin", "freeglut.dll")
-    return any(os.path.isfile(p) for p in inc_glut) and any(os.path.isfile(p) for p in lib_glut) and os.path.isfile(dll_glut)
+    dll_glut = [
+        os.path.join(mingw_root, "bin", "freeglut.dll"),
+        os.path.join(mingw_root, "bin", "libfreeglut.dll"),
+    ]
+    return any(os.path.isfile(p) for p in inc_glut) and any(os.path.isfile(p) for p in lib_glut) and any(os.path.isfile(p) for p in dll_glut)
 
 def install_mingw(target_dir):
     log_info(f"Setting up 64-bit MinGW-w64 at {target_dir}...")
@@ -239,41 +252,84 @@ def install_freeglut(mingw_root):
     ]
     bin_dir = os.path.join(mingw_root, "bin")
 
-    for d in inc_dirs + lib_dirs:
+    for d in inc_dirs + lib_dirs + [bin_dir]:
         os.makedirs(d, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         fg_zip = os.path.join(tmp_dir, "freeglut.zip")
-        if not download_file_with_progress(FREEGLUT_URLS, fg_zip, "FreeGLUT Package (~3 MB)"):
+        if not download_file_with_progress(FREEGLUT_URLS, fg_zip, "FreeGLUT Package (~1 MB)"):
             return False
 
-        log_info("Extracting FreeGLUT...")
+        log_info("Extracting FreeGLUT package...")
         with zipfile.ZipFile(fg_zip, "r") as zf:
             zf.extractall(tmp_dir)
 
-        fg_dir = os.path.join(tmp_dir, "freeglut")
+        # 1. Install headers
+        header_count = 0
+        for root, dirs, files in os.walk(tmp_dir):
+            if any(h in files for h in ["glut.h", "freeglut.h"]):
+                for file in files:
+                    if file.endswith(".h"):
+                        src = os.path.join(root, file)
+                        for dest in inc_dirs:
+                            shutil.copy2(src, os.path.join(dest, file))
+                        header_count += 1
+                break
+        log_ok(f"Installed {header_count} OpenGL/GLUT headers.")
 
-        # Copy headers
-        inc_src = os.path.join(fg_dir, "include", "GL")
-        if os.path.isdir(inc_src):
-            for h in os.listdir(inc_src):
-                for dest in inc_dirs:
-                    shutil.copy2(os.path.join(inc_src, h), os.path.join(dest, h))
-            log_ok("Headers copied (GL/glut.h, GL/freeglut.h).")
+        # 2. Install 64-bit libraries
+        # Prefer x64 folder if present, otherwise general lib folder
+        lib_folder = None
+        for root, dirs, files in os.walk(tmp_dir):
+            if "x64" in root.lower() and any(f.endswith(".a") for f in files):
+                lib_folder = root
+                break
+        if not lib_folder:
+            for root, dirs, files in os.walk(tmp_dir):
+                if any(f.endswith(".a") for f in files):
+                    lib_folder = root
+                    break
 
-        # Copy 64-bit libraries
-        lib_src = os.path.join(fg_dir, "lib", "x64")
-        if os.path.isdir(lib_src):
-            for lib in os.listdir(lib_src):
-                for dest in lib_dirs:
-                    shutil.copy2(os.path.join(lib_src, lib), os.path.join(dest, lib))
-            log_ok("Static/import libraries copied (libfreeglut.a).")
+        if lib_folder:
+            for file in os.listdir(lib_folder):
+                if file.endswith((".a", ".lib")):
+                    src = os.path.join(lib_folder, file)
+                    for dest in lib_dirs:
+                        shutil.copy2(src, os.path.join(dest, file))
+                    # Ensure canonical 'libfreeglut.a' always exists
+                    if "freeglut" in file.lower():
+                        for dest in lib_dirs:
+                            shutil.copy2(src, os.path.join(dest, "libfreeglut.a"))
+            log_ok("Installed FreeGLUT static and import libraries.")
 
-        # Copy runtime DLL to bin/
-        dll_src = os.path.join(fg_dir, "bin", "x64", "freeglut.dll")
-        if os.path.isfile(dll_src):
-            shutil.copy2(dll_src, os.path.join(bin_dir, "freeglut.dll"))
-            log_ok("Runtime DLL copied (freeglut.dll -> bin/).")
+        # 3. Install runtime DLL
+        dll_found = False
+        for root, dirs, files in os.walk(tmp_dir):
+            # Prefer 64-bit DLL
+            if "x64" in root.lower() and any(f.endswith(".dll") for f in files):
+                for f in files:
+                    if f.endswith(".dll"):
+                        src = os.path.join(root, f)
+                        # Copy as both freeglut.dll and libfreeglut.dll for universal compatibility
+                        shutil.copy2(src, os.path.join(bin_dir, "freeglut.dll"))
+                        shutil.copy2(src, os.path.join(bin_dir, "libfreeglut.dll"))
+                        dll_found = True
+                break
+
+        if not dll_found:
+            for root, dirs, files in os.walk(tmp_dir):
+                for f in files:
+                    if f.endswith(".dll") and "freeglut" in f.lower():
+                        src = os.path.join(root, f)
+                        shutil.copy2(src, os.path.join(bin_dir, "freeglut.dll"))
+                        shutil.copy2(src, os.path.join(bin_dir, "libfreeglut.dll"))
+                        dll_found = True
+                        break
+
+        if dll_found:
+            log_ok(f"Installed runtime DLLs (freeglut.dll & libfreeglut.dll) to: {bin_dir}")
+        else:
+            log_warn("Could not locate freeglut DLL in archive.")
 
     return True
 
@@ -360,7 +416,7 @@ def verify_setup(mingw_root):
         try:
             run_res = subprocess.run([exe], capture_output=True, text=True, env=env, timeout=10)
             if "FREEGLUT_VERIFIED_SUCCESS" in run_res.stdout:
-                log_ok("Runtime test passed! (freeglut.dll loaded and initialized successfully).")
+                log_ok("Runtime test passed! (DLL loaded and initialized successfully).")
                 return True
             else:
                 log_err(f"Runtime failed: {run_res.stderr}")
